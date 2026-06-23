@@ -1,0 +1,499 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#101820">
+    <title>Claremont Train Times</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f4f6f8;
+        --panel: #ffffff;
+        --ink: #101820;
+        --muted: #607080;
+        --line: #d8dee4;
+        --accent: #0072bc;
+        --ok: #117a3a;
+        --warn: #a84d00;
+        --bad: #b3261e;
+        --shadow: 0 10px 30px rgba(16, 24, 32, 0.08);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: var(--bg);
+        color: var(--ink);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      }
+
+      .shell {
+        width: min(1120px, 100%);
+        margin: 0 auto;
+        padding: max(18px, env(safe-area-inset-top)) 18px max(18px, env(safe-area-inset-bottom));
+      }
+
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        padding: 10px 2px 18px;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: clamp(28px, 5vw, 54px);
+        line-height: 0.95;
+        letter-spacing: 0;
+      }
+
+      .status {
+        min-height: 0;
+        color: var(--muted);
+        font-size: 15px;
+      }
+
+      .refresh-button {
+        flex: 0 0 auto;
+        min-width: 88px;
+        min-height: 40px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel);
+        color: var(--ink);
+        font: inherit;
+        font-weight: 800;
+        box-shadow: var(--shadow);
+      }
+
+      .refresh-button:disabled {
+        opacity: 0.6;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 16px;
+      }
+
+      .direction-toggle {
+        display: none;
+      }
+
+      .board {
+        min-width: 0;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel);
+        box-shadow: var(--shadow);
+      }
+
+      .board-head {
+        padding: 15px 16px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .board-title {
+        margin: 0;
+        font-size: 22px;
+        line-height: 1.1;
+      }
+
+      .list {
+        display: grid;
+        min-height: 260px;
+      }
+
+      .train {
+        display: grid;
+        grid-template-columns: 76px minmax(0, 1fr) 58px;
+        align-items: center;
+        column-gap: 18px;
+        min-height: 76px;
+        padding: 14px 16px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .train:last-child {
+        border-bottom: 0;
+      }
+
+      .time {
+        font-variant-numeric: tabular-nums;
+        font-size: 28px;
+        font-weight: 800;
+        line-height: 1;
+      }
+
+      .due {
+        display: grid;
+        align-content: center;
+        min-height: 48px;
+        padding: 5px 6px;
+        border-radius: 6px;
+        background: #eef5f1;
+        color: var(--ok);
+        font-weight: 800;
+        text-align: center;
+      }
+
+      .due-now {
+        background: #fff4e8;
+        color: var(--warn);
+      }
+
+      .due-value {
+        font-size: 22px;
+        font-variant-numeric: tabular-nums;
+        line-height: 1;
+      }
+
+      .due-label {
+        margin-top: 2px;
+        font-size: 11px;
+        line-height: 1;
+        text-transform: uppercase;
+      }
+
+      .details {
+        min-width: 0;
+        padding-left: 6px;
+      }
+
+      .destination {
+        overflow: hidden;
+        color: var(--ink);
+        font-size: 18px;
+        font-weight: 700;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .subline {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 5px;
+        color: var(--muted);
+        font-size: 14px;
+      }
+
+      .status-pill {
+        color: var(--ok);
+        font-weight: 700;
+      }
+
+      .status-pill.delay {
+        color: var(--warn);
+      }
+
+      .status-pill.cancelled {
+        color: var(--bad);
+      }
+
+      .empty,
+      .error {
+        display: grid;
+        place-items: center;
+        min-height: 260px;
+        padding: 24px;
+        color: var(--muted);
+        text-align: center;
+      }
+
+      .error {
+        color: var(--bad);
+      }
+
+      @media (max-width: 760px) {
+        .shell {
+          padding-left: 12px;
+          padding-right: 12px;
+        }
+
+        header {
+          align-items: flex-start;
+          padding-bottom: 14px;
+        }
+
+        .refresh-button {
+          min-width: 78px;
+          min-height: 38px;
+          box-shadow: none;
+        }
+
+        .grid {
+          grid-template-columns: 1fr;
+          gap: 12px;
+        }
+
+        .direction-toggle {
+          display: grid;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 4px;
+          margin: 0 0 12px;
+          padding: 4px;
+          border: 1px solid var(--line);
+          border-radius: 8px;
+          background: var(--panel);
+        }
+
+        .direction-toggle button {
+          min-height: 42px;
+          border: 0;
+          border-radius: 6px;
+          background: transparent;
+          color: var(--muted);
+          font: inherit;
+          font-weight: 800;
+        }
+
+        .direction-toggle button[aria-pressed="true"] {
+          background: var(--accent);
+          color: #ffffff;
+        }
+
+        .board {
+          display: none;
+        }
+
+        .board.active {
+          display: block;
+        }
+
+        .board-head {
+          padding: 13px 14px;
+        }
+
+        .board-title {
+          font-size: 20px;
+        }
+
+        .train {
+          grid-template-columns: 62px minmax(0, 1fr) 52px;
+          min-height: 72px;
+          column-gap: 14px;
+          padding: 12px;
+        }
+
+        .time {
+          font-size: 23px;
+        }
+
+        .due {
+          min-height: 44px;
+          padding: 5px;
+        }
+
+        .due-value {
+          font-size: 20px;
+        }
+
+        .destination {
+          font-size: 17px;
+        }
+
+        .details {
+          padding-left: 4px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <header>
+        <div>
+          <h1>Claremont</h1>
+          <div class="status" id="status" aria-live="polite"></div>
+        </div>
+        <button class="refresh-button" id="refresh-button" type="button" aria-label="Refresh train times">Refresh</button>
+      </header>
+
+      <div class="direction-toggle" aria-label="Choose train direction">
+        <button type="button" data-direction="fremantle" aria-pressed="false">To Freo</button>
+        <button type="button" data-direction="perth" aria-pressed="true">To Perth</button>
+      </div>
+
+      <section class="grid" aria-label="Live train departures">
+        <article class="board" data-board="fremantle" aria-labelledby="to-fremantle-title">
+          <div class="board-head">
+            <h2 class="board-title" id="to-fremantle-title">To Fremantle</h2>
+          </div>
+          <div class="list" id="fremantle-list"></div>
+        </article>
+
+        <article class="board active" data-board="perth" aria-labelledby="other-way-title">
+          <div class="board-head">
+            <h2 class="board-title" id="other-way-title">To Perth</h2>
+          </div>
+          <div class="list" id="other-list"></div>
+        </article>
+      </section>
+    </main>
+
+    <script>
+      const STATION = "claremont";
+      const REFERENCE_STATION = "swanbourne";
+      const LINE = "all";
+      const REFRESH_MS = 60000;
+
+      const statusEl = document.getElementById("status");
+      const refreshButton = document.getElementById("refresh-button");
+      const fremantleListEl = document.getElementById("fremantle-list");
+      const otherListEl = document.getElementById("other-list");
+      const directionButtons = document.querySelectorAll(".direction-toggle button");
+      const directionBoards = document.querySelectorAll("[data-board]");
+      let isLoading = false;
+
+      function setDirection(direction) {
+        directionButtons.forEach((button) => {
+          button.setAttribute("aria-pressed", String(button.dataset.direction === direction));
+        });
+        directionBoards.forEach((board) => {
+          board.classList.toggle("active", board.dataset.board === direction);
+        });
+      }
+
+      directionButtons.forEach((button) => {
+        button.addEventListener("click", () => setDirection(button.dataset.direction));
+      });
+
+      function escapeHtml(value) {
+        return String(value ?? "")
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#039;");
+      }
+
+      function statusClass(status) {
+        const value = String(status || "").toLowerCase();
+        if (value.includes("cancel")) return "cancelled";
+        if (value.includes("delay") || value.includes("late")) return "delay";
+        return "";
+      }
+
+      function minutesUntil(departure) {
+        const match = /^(\d{1,2}):(\d{2})$/.exec(String(departure || ""));
+        if (!match) return null;
+
+        const now = new Date();
+        const departureTime = new Date(now);
+        departureTime.setHours(Number(match[1]), Number(match[2]), 0, 0);
+
+        let minutes = Math.ceil((departureTime.getTime() - now.getTime()) / 60000);
+        if (minutes < -720) minutes += 1440;
+        if (minutes < 0) return 0;
+        return minutes;
+      }
+
+      function dueText(minutes) {
+        if (minutes == null) return { value: "-", label: "min" };
+        if (minutes === 0) return { value: "Now", label: "" };
+        return { value: String(minutes), label: minutes === 1 ? "min" : "mins" };
+      }
+
+      function originLabel(origin) {
+        return origin === "Fremantle" ? "Freo" : origin;
+      }
+
+      function renderTrain(service) {
+        const status = service.StatusDetail || "Scheduled";
+        const platform = service.Platform || "-";
+        const cars = service.Ncar ? `${service.Ncar} car` : "";
+        const realtime = service.IsRealTime ? "live" : "scheduled";
+        const origin = service.InferredOrigin ? `from ${originLabel(service.InferredOrigin)}` : "";
+        const bits = [origin, cars, realtime].filter(Boolean).join(" / ");
+        const due = dueText(minutesUntil(service.Departure));
+
+        return `
+          <div class="train">
+            <div class="time">${escapeHtml(service.Departure || "-")}</div>
+            <div class="details">
+              <div class="destination">${escapeHtml(service.Destination || "Unknown")}</div>
+              <div class="subline">
+                <span class="status-pill ${statusClass(status)}">${escapeHtml(status)}</span>
+                <span>${escapeHtml(bits)}</span>
+              </div>
+            </div>
+            <div class="due ${due.value === "Now" ? "due-now" : ""}" data-platform="${escapeHtml(platform)}" aria-label="Due in ${escapeHtml(due.value)} ${escapeHtml(due.label)}">
+              <div class="due-value">${escapeHtml(due.value)}</div>
+              <div class="due-label">${escapeHtml(due.label)}</div>
+            </div>
+          </div>
+        `;
+      }
+
+      function renderList(element, services, emptyText) {
+        element.innerHTML = services.length
+          ? services.map(renderTrain).join("")
+          : `<div class="empty">${escapeHtml(emptyText)}</div>`;
+      }
+
+      function renderError(message) {
+        fremantleListEl.innerHTML = `<div class="error">${escapeHtml(message)}</div>`;
+        otherListEl.innerHTML = `<div class="error">${escapeHtml(message)}</div>`;
+      }
+
+      async function loadTrains() {
+        if (isLoading) return;
+        isLoading = true;
+        refreshButton.disabled = true;
+        const params = new URLSearchParams({
+          line: LINE,
+          station: STATION,
+          referenceStation: REFERENCE_STATION
+        });
+        const apiUrl = new URL("/trains/api/trains", window.location.origin);
+        apiUrl.search = params.toString();
+        statusEl.textContent = "";
+
+        try {
+          const response = await fetch(apiUrl.toString(), {
+            cache: "no-store",
+            headers: { Accept: "application/json" }
+          });
+
+          const responseText = await response.text();
+          let payload;
+          try {
+            payload = JSON.parse(responseText);
+          } catch {
+            throw new Error(`API returned ${response.status}: ${responseText.slice(0, 120)}`);
+          }
+
+          if (!response.ok || payload.result !== "success") {
+            throw new Error(payload.error || `API returned ${response.status}`);
+          }
+
+          const data = payload.data || {};
+          const services = Array.isArray(data.StatusDetailList) ? data.StatusDetailList : [];
+          const toFremantle = services.filter((service) => service.Destination === "Fremantle");
+          const otherWay = services.filter((service) => service.Destination !== "Fremantle");
+
+          statusEl.textContent = "";
+          renderList(fremantleListEl, toFremantle, "No Fremantle-bound services returned.");
+          renderList(otherListEl, otherWay, "No other services returned.");
+        } catch (error) {
+          statusEl.textContent = "Live data unavailable";
+          renderError(`Could not load train times: ${error.message || "unknown error"}`);
+        } finally {
+          isLoading = false;
+          refreshButton.disabled = false;
+        }
+      }
+
+      refreshButton.addEventListener("click", loadTrains);
+      loadTrains();
+      window.setInterval(loadTrains, REFRESH_MS);
+    </script>
+  </body>
+</html>
