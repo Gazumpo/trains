@@ -60,6 +60,8 @@
       }
 
       .refresh-button {
+        display: grid;
+        place-items: center;
         flex: 0 0 auto;
         min-width: 88px;
         min-height: 40px;
@@ -69,11 +71,8 @@
         color: var(--ink);
         font: inherit;
         font-weight: 800;
+        text-decoration: none;
         box-shadow: var(--shadow);
-      }
-
-      .refresh-button:disabled {
-        opacity: 0.6;
       }
 
       .grid {
@@ -206,10 +205,42 @@
         padding: 24px;
         color: var(--muted);
         text-align: center;
+        overflow-wrap: anywhere;
       }
 
       .error {
         color: var(--bad);
+      }
+
+      .diagnostics {
+        margin-top: 16px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel);
+        color: var(--muted);
+      }
+
+      .diagnostics summary {
+        padding: 12px 14px;
+        cursor: pointer;
+        font-size: 14px;
+        font-weight: 800;
+      }
+
+      .diagnostic-state {
+        font-weight: 500;
+      }
+
+      .diagnostic-log {
+        max-height: 300px;
+        margin: 0;
+        overflow: auto;
+        border-top: 1px solid var(--line);
+        padding: 12px 14px;
+        color: var(--ink);
+        font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        white-space: pre-wrap;
+        word-break: break-word;
       }
 
       @media (max-width: 760px) {
@@ -313,7 +344,7 @@
           <h1>Claremont</h1>
           <div class="status" id="status" aria-live="polite"></div>
         </div>
-        <button class="refresh-button" id="refresh-button" type="button" aria-label="Refresh train times">Refresh</button>
+        <a class="refresh-button" id="refresh-button" href="?appRefresh=1" aria-label="Refresh train times">Refresh</a>
       </header>
 
       <div class="direction-toggle" aria-label="Choose train direction">
@@ -336,21 +367,107 @@
           <div class="list" id="other-list"></div>
         </article>
       </section>
+
+      <details class="diagnostics">
+        <summary>
+          Diagnostics <span class="diagnostic-state" id="diagnostic-state"></span>
+        </summary>
+        <pre class="diagnostic-log" id="diagnostic-log">Starting app…</pre>
+      </details>
     </main>
 
     <script>
+      const APP_VERSION = "2026-07-17.2";
       const STATION = "claremont";
       const REFERENCE_STATION = "swanbourne";
       const LINE = "all";
       const REFRESH_MS = 60000;
+      const RENDER_TICK_MS = 15000;
+      const REQUEST_TIMEOUT_MS = 20000;
+      const MAX_DATA_AGE_MS = 120000;
+      const MAX_UPSTREAM_DATA_AGE_MS = 180000;
+      const DEPARTURE_GRACE_MS = 60000;
+      const DIAGNOSTIC_STORAGE_KEY = "claremont-trains-diagnostics-v1";
+      const MAX_DIAGNOSTIC_ENTRIES = 60;
 
       const statusEl = document.getElementById("status");
       const refreshButton = document.getElementById("refresh-button");
       const fremantleListEl = document.getElementById("fremantle-list");
       const otherListEl = document.getElementById("other-list");
+      const diagnosticStateEl = document.getElementById("diagnostic-state");
+      const diagnosticLogEl = document.getElementById("diagnostic-log");
       const directionButtons = document.querySelectorAll(".direction-toggle button");
       const directionBoards = document.querySelectorAll("[data-board]");
+      const pageStartedAt = Date.now();
+      const sessionId =
+        globalThis.crypto && typeof globalThis.crypto.randomUUID === "function"
+          ? globalThis.crypto.randomUUID()
+          : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const initialUrl = new URL(window.location.href);
+      const bypassCacheOnStartup = initialUrl.searchParams.has("appRefresh");
+
       let isLoading = false;
+      let activeRequest = null;
+      let requestNumber = 0;
+      let currentServices = [];
+      let currentDataFetchedAt = 0;
+      let lastRenderedServiceCount = null;
+      let lastResumeCheckAt = 0;
+      let diagnosticEntries = readStoredDiagnostics();
+
+      function readStoredDiagnostics() {
+        try {
+          const stored = JSON.parse(localStorage.getItem(DIAGNOSTIC_STORAGE_KEY) || "[]");
+          return Array.isArray(stored) ? stored.slice(-MAX_DIAGNOSTIC_ENTRIES) : [];
+        } catch {
+          return [];
+        }
+      }
+
+      function renderDiagnostics() {
+        const visibleEntries = diagnosticEntries.slice(-MAX_DIAGNOSTIC_ENTRIES);
+        diagnosticLogEl.textContent = visibleEntries
+          .map((entry) => {
+            const time = String(entry.time || "").slice(11, 23);
+            const details = entry.details && Object.keys(entry.details).length
+              ? ` ${JSON.stringify(entry.details)}`
+              : "";
+            const version = entry.appVersion ? ` v${entry.appVersion}` : "";
+            return `${time}${version} ${String(entry.level || "info").toUpperCase()} ${entry.event}${details}`;
+          })
+          .join("\n");
+
+        const latest = visibleEntries[visibleEntries.length - 1];
+        diagnosticStateEl.textContent = latest ? `· ${latest.event}` : "";
+      }
+
+      function logDiagnostic(event, details = {}, level = "info") {
+        const entry = {
+          time: new Date().toISOString(),
+          sessionId,
+          appVersion: APP_VERSION,
+          level,
+          event,
+          details
+        };
+        diagnosticEntries.push(entry);
+        diagnosticEntries = diagnosticEntries.slice(-MAX_DIAGNOSTIC_ENTRIES);
+
+        try {
+          localStorage.setItem(DIAGNOSTIC_STORAGE_KEY, JSON.stringify(diagnosticEntries));
+        } catch {
+          // Diagnostics still remain visible for the current page session.
+        }
+
+        renderDiagnostics();
+        if (level === "error") {
+          console.error(`[trains] ${event}`, details);
+        } else if (level === "warn") {
+          console.warn(`[trains] ${event}`, details);
+        } else {
+          console.log(`[trains] ${event}`, details);
+        }
+      }
 
       function setDirection(direction) {
         directionButtons.forEach((button) => {
@@ -381,23 +498,53 @@
         return "";
       }
 
-      function minutesUntil(departure) {
+      function departureTimestamp(departure, dataFetchedAt, departureAt = null) {
+        const explicitDepartureAt = Date.parse(departureAt);
+        if (Number.isFinite(explicitDepartureAt)) return explicitDepartureAt;
+
         const match = /^(\d{1,2}):(\d{2})$/.exec(String(departure || ""));
-        if (!match) return null;
+        const fetchedAt = Number(dataFetchedAt);
+        if (!match || !Number.isFinite(fetchedAt)) return null;
 
-        const now = new Date();
-        const departureTime = new Date(now);
+        const departureTime = new Date(fetchedAt);
         departureTime.setHours(Number(match[1]), Number(match[2]), 0, 0);
+        let departureMs = departureTime.getTime();
+        const differenceFromFetch = departureMs - fetchedAt;
 
-        let minutes = Math.ceil((departureTime.getTime() - now.getTime()) / 60000);
-        if (minutes < -720) minutes += 1440;
-        if (minutes < 0) return 0;
-        return minutes;
+        if (differenceFromFetch > 12 * 60 * 60 * 1000) {
+          departureMs -= 24 * 60 * 60 * 1000;
+        } else if (differenceFromFetch < -12 * 60 * 60 * 1000) {
+          departureMs += 24 * 60 * 60 * 1000;
+        }
+
+        return departureMs;
+      }
+
+      function minutesUntil(
+        departure,
+        dataFetchedAt = currentDataFetchedAt,
+        now = Date.now(),
+        departureAt = null
+      ) {
+        const departureMs = departureTimestamp(departure, dataFetchedAt, departureAt);
+        if (departureMs == null) return null;
+        return Math.ceil((departureMs - now) / 60000);
+      }
+
+      function currentFutureServices(services, dataFetchedAt, now = Date.now()) {
+        return services.filter((service) => {
+          const departureMs = departureTimestamp(
+            service.Departure,
+            dataFetchedAt,
+            service.DepartureAt
+          );
+          return departureMs != null && departureMs >= now - DEPARTURE_GRACE_MS;
+        });
       }
 
       function dueText(minutes) {
         if (minutes == null) return { value: "-", label: "min" };
-        if (minutes === 0) return { value: "Now", label: "" };
+        if (minutes <= 0) return { value: "Now", label: "" };
         return { value: String(minutes), label: minutes === 1 ? "min" : "mins" };
       }
 
@@ -405,14 +552,16 @@
         return origin === "Fremantle" ? "Freo" : origin;
       }
 
-      function renderTrain(service) {
+      function renderTrain(service, now = Date.now()) {
         const status = service.StatusDetail || "Scheduled";
         const platform = service.Platform || "-";
         const cars = service.Ncar ? `${service.Ncar} car` : "";
         const realtime = service.IsRealTime ? "live" : "scheduled";
         const origin = service.InferredOrigin ? `from ${originLabel(service.InferredOrigin)}` : "";
         const bits = [origin, cars, realtime].filter(Boolean).join(" / ");
-        const due = dueText(minutesUntil(service.Departure));
+        const due = dueText(
+          minutesUntil(service.Departure, currentDataFetchedAt, now, service.DepartureAt)
+        );
 
         return `
           <div class="train">
@@ -432,36 +581,187 @@
         `;
       }
 
-      function renderList(element, services, emptyText) {
+      function renderList(element, services, emptyText, now) {
         element.innerHTML = services.length
-          ? services.map(renderTrain).join("")
+          ? services.map((service) => renderTrain(service, now)).join("")
           : `<div class="empty">${escapeHtml(emptyText)}</div>`;
       }
 
-      function renderError(message) {
-        fremantleListEl.innerHTML = `<div class="error">${escapeHtml(message)}</div>`;
-        otherListEl.innerHTML = `<div class="error">${escapeHtml(message)}</div>`;
+      function renderCurrentServices(now = Date.now()) {
+        const services = currentFutureServices(currentServices, currentDataFetchedAt, now);
+        const toFremantle = services.filter(
+          (service) => String(service.Destination).toLowerCase() === "fremantle"
+        );
+        const otherWay = services.filter(
+          (service) => String(service.Destination).toLowerCase() !== "fremantle"
+        );
+
+        renderList(
+          fremantleListEl,
+          toFremantle,
+          "No current Fremantle-bound services.",
+          now
+        );
+        renderList(otherListEl, otherWay, "No current Perth-bound services.", now);
+
+        if (lastRenderedServiceCount != null && services.length !== lastRenderedServiceCount) {
+          logDiagnostic("departures-pruned", {
+            previousCount: lastRenderedServiceCount,
+            currentCount: services.length
+          });
+        }
+        lastRenderedServiceCount = services.length;
+        return services.length;
       }
 
-      async function loadTrains() {
-        if (isLoading) return;
+      function renderMessage(message, className = "empty") {
+        const html = `<div class="${className}">${escapeHtml(message)}</div>`;
+        fremantleListEl.innerHTML = html;
+        otherListEl.innerHTML = html;
+      }
+
+      function clearDisplayedServices(message) {
+        currentServices = [];
+        currentDataFetchedAt = 0;
+        lastRenderedServiceCount = null;
+        renderMessage(message);
+      }
+
+      function renderError(message) {
+        clearDisplayedServices(message);
+        const html = `<div class="error">${escapeHtml(message)}</div>`;
+        fremantleListEl.innerHTML = html;
+        otherListEl.innerHTML = html;
+      }
+
+      function parseFreshness(payload, receivedAt) {
+        const meta = payload.meta || {};
+        const fetchedAtText = meta.stationDataFetchedAt;
+        const fetchedAt = Date.parse(fetchedAtText);
+        if (!Number.isFinite(fetchedAt)) {
+          throw new Error("API response has no valid stationDataFetchedAt timestamp.");
+        }
+
+        const ageMs = receivedAt - fetchedAt;
+        if (ageMs < -60000) {
+          throw new Error(`API data timestamp is ${Math.round(Math.abs(ageMs) / 1000)}s in the future.`);
+        }
+        if (ageMs > MAX_DATA_AGE_MS) {
+          throw new Error(`API data is stale (${Math.round(ageMs / 1000)}s old).`);
+        }
+
+        const upstreamLastUpdatedAt = Date.parse(meta.upstreamLastUpdatedAt);
+        if (!Number.isFinite(upstreamLastUpdatedAt)) {
+          throw new Error("API response has no valid upstreamLastUpdatedAt timestamp.");
+        }
+        const upstreamAgeMs = receivedAt - upstreamLastUpdatedAt;
+        if (upstreamAgeMs < -60000) {
+          throw new Error("Transperth data timestamp is unexpectedly in the future.");
+        }
+        if (upstreamAgeMs > MAX_UPSTREAM_DATA_AGE_MS) {
+          throw new Error(
+            `Transperth data is stale (${Math.round(upstreamAgeMs / 1000)}s old).`
+          );
+        }
+
+        return {
+          fetchedAt,
+          ageMs: Math.max(0, ageMs),
+          upstreamLastUpdatedAt,
+          upstreamAgeMs: Math.max(0, upstreamAgeMs)
+        };
+      }
+
+      function formatAge(ageMs) {
+        if (ageMs < 1000) return "just now";
+        return `${Math.round(ageMs / 1000)}s old`;
+      }
+
+      function formatTime(timestamp) {
+        return new Date(timestamp).toLocaleTimeString([], {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit"
+        });
+      }
+
+      function buildRefreshUrl() {
+        const refreshUrl = new URL(window.location.href);
+        refreshUrl.searchParams.set("appRefresh", String(Date.now()));
+        return refreshUrl;
+      }
+
+      async function loadTrains({
+        force = false,
+        bypassCache = false,
+        clear = false,
+        reason = "automatic"
+      } = {}) {
+        if (isLoading && !force) {
+          logDiagnostic("refresh-skipped", { reason, cause: "request-in-progress" }, "warn");
+          return;
+        }
+
+        if (activeRequest) activeRequest.abort();
+
+        const controller = new AbortController();
+        const thisRequest = ++requestNumber;
+        const requestStartedAt = Date.now();
+        let requestTimedOut = false;
+        const timeout = window.setTimeout(() => {
+          requestTimedOut = true;
+          controller.abort();
+        }, REQUEST_TIMEOUT_MS);
+
+        activeRequest = controller;
         isLoading = true;
-        refreshButton.disabled = true;
+        refreshButton.setAttribute("aria-busy", "true");
+        statusEl.textContent = "Refreshing live services…";
+        if (clear) {
+          clearDisplayedServices("Loading live services…");
+        } else if (!currentDataFetchedAt) {
+          renderMessage("Loading live services…");
+        }
+
         const params = new URLSearchParams({
           line: LINE,
           station: STATION,
-          referenceStation: REFERENCE_STATION
+          referenceStation: REFERENCE_STATION,
+          requestTime: String(Date.now())
         });
+        if (bypassCache) params.set("fresh", "true");
         const apiUrl = new URL("/trains/api/trains", window.location.origin);
         apiUrl.search = params.toString();
-        statusEl.textContent = "";
 
+        logDiagnostic("api-request-start", {
+          requestNumber: thisRequest,
+          reason,
+          bypassCache,
+          method: "POST",
+          online: navigator.onLine,
+          visibility: document.visibilityState
+        });
+
+        let responseRequestId = "";
+        let responseStatus = null;
+        let cfRay = "";
         try {
           const response = await fetch(apiUrl.toString(), {
+            method: "POST",
             cache: "no-store",
-            headers: { Accept: "application/json" }
+            headers: {
+              Accept: "application/json",
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+              requestTime: Date.now(),
+              bypassCache
+            }),
+            signal: controller.signal
           });
-
+          responseStatus = response.status;
+          responseRequestId = response.headers.get("x-request-id") || "";
+          cfRay = response.headers.get("cf-ray") || "";
           const responseText = await response.text();
           let payload;
           try {
@@ -473,27 +773,189 @@
           if (!response.ok || payload.result !== "success") {
             throw new Error(payload.error || `API returned ${response.status}`);
           }
+          if (thisRequest !== requestNumber) return;
 
+          const receivedAt = Date.now();
+          const freshness = parseFreshness(payload, receivedAt);
           const data = payload.data || {};
           const services = Array.isArray(data.StatusDetailList) ? data.StatusDetailList : [];
-          const toFremantle = services.filter((service) => service.Destination === "Fremantle");
-          const otherWay = services.filter((service) => service.Destination !== "Fremantle");
 
-          statusEl.textContent = "";
-          renderList(fremantleListEl, toFremantle, "No Fremantle-bound services returned.");
-          renderList(otherListEl, otherWay, "No other services returned.");
+          currentServices = services;
+          currentDataFetchedAt = freshness.fetchedAt;
+          lastRenderedServiceCount = null;
+          const visibleServiceCount = renderCurrentServices(receivedAt);
+          const meta = payload.meta || {};
+          const requestId = meta.requestId || responseRequestId || "unknown";
+          const source = meta.stationSource || "unknown source";
+
+          statusEl.textContent =
+            `Updated ${formatTime(receivedAt)} · ${visibleServiceCount} services · ` +
+            `${source} · Transperth ${formatAge(freshness.upstreamAgeMs)}`;
+          logDiagnostic("api-request-success", {
+            requestNumber: thisRequest,
+            requestId,
+            cfRay: cfRay || null,
+            httpStatus: response.status,
+            durationMs: receivedAt - requestStartedAt,
+            stationSource: source,
+            stationDataFetchedAt: meta.stationDataFetchedAt,
+            dataAgeMs: freshness.ageMs,
+            upstreamLastUpdatedAt: meta.upstreamLastUpdatedAt,
+            upstreamDataAgeMs: freshness.upstreamAgeMs,
+            apiServiceCount: services.length,
+            visibleServiceCount,
+            workerVersion: meta.workerVersion,
+            stationAttempts: meta.stationAttempts,
+            stationUpstreamDurationMs: meta.stationUpstreamDurationMs,
+            referenceError: meta.referenceError || null
+          });
         } catch (error) {
+          if (thisRequest !== requestNumber) return;
+
+          const message = requestTimedOut
+            ? "The live-data request timed out."
+            : navigator.onLine === false
+              ? "This device appears to be offline."
+              : error.message || "Unknown live-data error.";
           statusEl.textContent = "Live data unavailable";
-          renderError(`Could not load train times: ${error.message || "unknown error"}`);
+          renderError(`${message} Old train times have been removed.`);
+          logDiagnostic(
+            "api-request-failed",
+            {
+              requestNumber: thisRequest,
+              requestId: responseRequestId || null,
+              httpStatus: responseStatus,
+              cfRay: cfRay || null,
+              reason,
+              bypassCache,
+              durationMs: Date.now() - requestStartedAt,
+              errorName: error.name || "Error",
+              error: error.message || String(error),
+              timedOut: requestTimedOut,
+              online: navigator.onLine
+            },
+            "error"
+          );
         } finally {
+          window.clearTimeout(timeout);
+          if (thisRequest !== requestNumber) return;
+
+          activeRequest = null;
           isLoading = false;
-          refreshButton.disabled = false;
+          refreshButton.removeAttribute("aria-busy");
         }
       }
 
-      refreshButton.addEventListener("click", loadTrains);
-      loadTrains();
-      window.setInterval(loadTrains, REFRESH_MS);
+      function refreshAfterResume(trigger) {
+        const now = Date.now();
+        if (now - lastResumeCheckAt < 1000) return;
+        lastResumeCheckAt = now;
+        const dataAgeMs = currentDataFetchedAt ? now - currentDataFetchedAt : null;
+        const stale = dataAgeMs == null || dataAgeMs > MAX_DATA_AGE_MS;
+
+        logDiagnostic("app-resumed", { trigger, dataAgeMs, stale });
+        if (stale) {
+          clearDisplayedServices("Previous train times expired. Loading fresh services…");
+        }
+        loadTrains({
+          force: true,
+          bypassCache: stale,
+          clear: stale,
+          reason: `resume:${trigger}`
+        });
+      }
+
+      refreshButton.addEventListener("click", () => {
+        const refreshUrl = buildRefreshUrl();
+        refreshButton.href = refreshUrl.toString();
+        logDiagnostic("manual-page-refresh", { url: refreshUrl.pathname });
+        // Do not prevent the default link navigation. It must work even if app state is unhealthy.
+      });
+
+      window.addEventListener("pageshow", (event) => {
+        logDiagnostic("pageshow", { persisted: event.persisted });
+        if (event.persisted) refreshAfterResume("pageshow");
+      });
+      window.addEventListener("focus", () => {
+        if (Date.now() - pageStartedAt > 2000) refreshAfterResume("focus");
+      });
+      window.addEventListener("online", () => {
+        logDiagnostic("network-online");
+        loadTrains({ force: true, bypassCache: true, clear: true, reason: "network-online" });
+      });
+      window.addEventListener("offline", () => {
+        logDiagnostic("network-offline", {}, "warn");
+        statusEl.textContent = "Offline";
+      });
+      window.addEventListener("pagehide", (event) => {
+        logDiagnostic("pagehide", { persisted: event.persisted });
+      });
+      window.addEventListener("error", (event) => {
+        logDiagnostic(
+          "javascript-error",
+          { message: event.message, filename: event.filename, line: event.lineno },
+          "error"
+        );
+      });
+      window.addEventListener("unhandledrejection", (event) => {
+        logDiagnostic(
+          "unhandled-rejection",
+          { reason: String(event.reason && event.reason.message || event.reason || "unknown") },
+          "error"
+        );
+      });
+      document.addEventListener("visibilitychange", () => {
+        logDiagnostic("visibility-change", { state: document.visibilityState });
+        if (document.visibilityState === "visible") refreshAfterResume("visibility");
+      });
+
+      renderDiagnostics();
+      logDiagnostic("app-start", {
+        standalone:
+          window.matchMedia("(display-mode: standalone)").matches ||
+          window.navigator.standalone === true,
+        online: navigator.onLine,
+        origin: window.location.origin,
+        path: window.location.pathname,
+        bypassCacheOnStartup
+      });
+
+      if (bypassCacheOnStartup && window.history && window.history.replaceState) {
+        initialUrl.searchParams.delete("appRefresh");
+        window.history.replaceState(null, "", initialUrl.toString());
+      }
+
+      loadTrains({
+        bypassCache: bypassCacheOnStartup,
+        clear: true,
+        reason: "startup"
+      });
+
+      window.setInterval(() => {
+        if (!currentDataFetchedAt) return;
+        const dataAgeMs = Date.now() - currentDataFetchedAt;
+        if (dataAgeMs > MAX_DATA_AGE_MS) {
+          logDiagnostic("displayed-data-expired", { dataAgeMs }, "warn");
+          clearDisplayedServices("Train times expired. Loading fresh services…");
+          if (document.visibilityState !== "visible") {
+            logDiagnostic("refresh-deferred", { cause: "app-hidden" });
+            return;
+          }
+          loadTrains({
+            force: true,
+            bypassCache: true,
+            clear: true,
+            reason: "displayed-data-expired"
+          });
+          return;
+        }
+        renderCurrentServices();
+      }, RENDER_TICK_MS);
+
+      window.setInterval(() => {
+        if (document.visibilityState !== "visible") return;
+        loadTrains({ reason: "scheduled-refresh" });
+      }, REFRESH_MS);
     </script>
   </body>
 </html>
